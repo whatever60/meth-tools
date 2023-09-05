@@ -44,6 +44,9 @@ FWD_TO: str
 REV_FROM: str
 REV_TO: str
 
+FROM: str
+TO: str
+
 
 def nopen_keep_parent_stdin(f, mode="r"):
     if f.startswith("|"):
@@ -117,39 +120,45 @@ def fasta_iter(fasta_name):
         yield header, "".join(s.strip() for s in next(faiter)).upper()
 
 
-def get_out_filename(input_path: str, out_dir: str):
+def get_out_filename(input_path: str, out_dir: str) -> str:
+    """
+    <input_dir>/<input_file>.<input_suffix> -> <out_dir>/<input_file>.<FWD_FROM>2<FWD_TO>.<input_suffix>
+    """
+    if out_dir is None:
+        out_dir = os.path.dirname(input_path)
     return os.path.join(
         out_dir,
         os.path.basename(
-            f".{FWD_FROM.lower()}2{FWD_TO.lower()}".join(os.path.splitext(input_path))
+            f".{FROM.lower()}2{TO.lower()}".join(os.path.splitext(input_path))
         ),
     )
+
+
+def detect_interleaved(fq: str) -> bool:
+    # examines first five lines to detect if this is an interleaved fastq file
+    fq = nopen(fq)
+    first_five = list(islice(fq, 5))
+    r1_header = first_five[0]
+    r2_header = first_five[-1]
+    if r1_header.split(" ")[0] == r2_header.split(" ")[0]:
+        return True
+    else:
+        return False
 
 
 def convert_reads(fq1s, fq2s, out_dir=None, out=sys.stdout):
     for fq1, fq2 in zip(fq1s.split(","), fq2s.split(",")):
         if out_dir is not None:
-            out_fq1 = get_out_filename(fq1.rstrip(".gz"), out_dir)            
-            out_fq2 = get_out_filename(fq2.rstrip(".gz"), out_dir)            
+            out_fq1 = get_out_filename(fq1.rstrip(".gz"), out_dir)
+            out_fq2 = get_out_filename(fq2.rstrip(".gz"), out_dir)
             out_fq1 = open(out_fq1, "w")
             out_fq2 = open(out_fq2, "w")
         else:
             out_fq1 = out_fq2 = out
         sys.stderr.write("converting reads in %s,%s\n" % (fq1, fq2))
         fq1 = nopen(fq1)
-
-        # examines first five lines to detect if this is an interleaved fastq file
-        first_five = list(islice(fq1, 5))
-
-        r1_header = first_five[0]
-        r2_header = first_five[-1]
-
-        if r1_header.split(" ")[0] == r2_header.split(" ")[0]:
-            already_interleaved = True
-        else:
-            already_interleaved = False
-
-        q1_iter = zip(*[chain.from_iterable([first_five, fq1])] * 4)
+        already_interleaved = detect_interleaved(fq1)
+        q1_iter = zip(*[fq1] * 4)
 
         if fq2 != "NA":
             fq2 = nopen(fq2)
@@ -210,44 +219,68 @@ def convert_and_write_read(name, seq, qual, read_i, out_fq1, out_fq2):
     out.write("".join((name, seq, "\n+\n", qual)))
 
 
-def convert_fasta(ref_fasta, out_dir, just_name=False):
-    out_fa = f".{FWD_FROM.lower()}2{FWD_TO.lower()}".join(os.path.splitext(ref_fasta))
-    out_fa = os.path.join(out_dir, os.path.basename(out_fa))
-    if just_name:
-        return out_fa
-    msg = "c2t in %s to %s" % (ref_fasta, out_fa)
-    if is_newer_b(ref_fasta, out_fa):
-        sys.stderr.write("already converted: %s\n" % msg)
-        return out_fa
-    sys.stderr.write("converting %s\n" % msg)
-    try:
-        fh = open(out_fa, "w")
-        for header, seq in fasta_iter(ref_fasta):
-            ########### Reverse ######################
-            fh.write(">r%s\n" % header)
-
-            # if non_cpg_only:
-            #    for ctx in "TAG": # use "ATC" for fwd
-            #        seq = seq.replace('G' + ctx, "A" + ctx)
-            #    for line in wrap(seq):
-            #        print >>fh, line
-            # else:
-            for line in wrap(seq.replace(REV_FROM, REV_TO)):
-                fh.write(line + "\n")
-
-            ########### Forward ######################
-            fh.write(">f%s\n" % header)
-            for line in wrap(seq.replace(FWD_FROM, FWD_TO)):
-                fh.write(line + "\n")
-        fh.close()
-    except:
+def convert_fasta(fas: str, out_dir: str, just_name=False) -> None:
+    for fa in fas.split(","):
+        out_fa = get_out_filename(fa, out_dir)
+        if just_name:
+            return out_fa
+        msg = f"{FROM}2{TO} in {fa} to {out_fa}"
+        sys.stderr.write(f"converting {msg}\n")
         try:
+            fh = open(out_fa, "w")
+            for header, seq in fasta_iter(fa):
+                fh.write(f">{header}\n")
+
+                # if non_cpg_only:
+                #    for ctx in "TAG": # use "ATC" for fwd
+                #        seq = seq.replace('G' + ctx, "A" + ctx)
+                #    for line in wrap(seq):
+                #        print >>fh, line
+                # else:
+                for line in wrap(seq.replace(FROM, TO)):
+                    fh.write(line + "\n")
             fh.close()
-        except UnboundLocalError:
-            pass
-        os.unlink(out_fa)
-        raise
-    return out_fa
+        except:
+            try:
+                fh.close()
+            except UnboundLocalError:
+                pass
+            os.unlink(out_fa)
+            raise
+
+
+def convert_reads(fqs: str, out_dir: str) -> None:
+    for fq in fqs.split(","):
+        out_fq = get_out_filename(fq.rstrip(".gz"), out_dir)
+        sys.stderr.write(f"converting reads in {fq}\n")
+        fq = nopen(fq)
+        q_iter = zip(*[fq, fq, fq, fq])  # a clever way to get 4 lines at a time
+
+        with open(out_fq, "w") as out:
+            for read_i, (name, seq, _, qual) in enumerate(q_iter):
+                if name is None:
+                    continue
+                name = name.rstrip("\r\n").split(" ")[0]
+                if name[0] != "@":
+                    sys.stderr.write(
+                        """ERROR!!!!
+                ERROR!!! FASTQ conversion failed
+                ERROR!!! expecting FASTQ 4-tuples, but found a record %s that doesn't start with "@"
+                """
+                        % name
+                    )
+                    sys.exit(1)
+                if name.endswith(("_R1", "_R2")):
+                    name = name[:-3]
+                elif name.endswith(("/1", "/2")):
+                    name = name[:-2]
+
+                seq = seq.upper().rstrip("\n")
+
+                # keep original sequence as name.
+                name = " ".join((name, "YS:Z:" + seq + "\tYC:Z:" + FROM + TO + "\n"))
+                seq = seq.replace(FROM, TO)
+                out.write("".join((name, seq, "\n+\n", qual)))
 
 
 def bwa_index(fa, ver="mem"):
@@ -575,25 +608,26 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command")
 
-    c2t_fa_parser = subparsers.add_parser("c2t_fa")
-    c2t_fa_parser.add_argument("fasta", help="reference fasta")
-    c2t_fa_parser.add_argument(
+    convert_parser = subparsers.add_parser("convert")
+    convert_parser.add_argument(
+        "-f", "--file_format", choices=["fa", "fq"], type=str, required=True
+    )
+    convert_parser.add_argument("-i", "--inputs", type=str, required=True)
+    convert_parser.add_argument("--out_dir", type=str, default=None)
+    convert_parser.add_argument(
         "--config", type=str, choices=["bs-seq", "glori"], default="bs-seq"
     )
-    c2t_fa_parser.add_argument("--out_dir", type=str, default=None)
+    convert_parser.add_argument(
+        "--from", type=str, choices=["A", "C", "G", "T"], dest="from_"
+    )
+    convert_parser.add_argument("--to", type=str, choices=["A", "C", "G", "T"])
+
     index_parser = subparsers.add_parser("index")
     index_parser.add_argument("index_fasta", help="reference fasta")
 
     index_mem2_parser = subparsers.add_parser("index-mem2")
     index_mem2_parser.add_argument("index_mem2_fasta", help="reference fasta")
 
-    c2t_fq_parser = subparsers.add_parser("c2t_fq")
-    c2t_fq_parser.add_argument("fq1", help="input FASTQ file 1")
-    c2t_fq_parser.add_argument("fq2", help="input FASTQ file 2")
-    c2t_fq_parser.add_argument("--out_dir", type=str, default=None)
-    c2t_fq_parser.add_argument(
-        "--config", type=str, choices=["bs-seq", "glori"], default="bs-seq"
-    )
     cnvs_parser = subparsers.add_parser("cnvs")
     cnvs_parser.add_argument("regions", help="regions file")
     cnvs_parser.add_argument("bams", nargs="+", help="input BAM files")
@@ -643,14 +677,17 @@ def main():
     else:
         raise NotImplementedError
 
-    if args.command == "c2t_fa":
-        sys.exit(convert_fasta(args.fasta, args.out_dir))
+    if args.command == "convert":
+        global FROM, TO
+        FROM, TO = args.from_, args.to
+        if args.file_format == "fa":
+            sys.exit(convert_fasta(args.inputs, args.out_dir))
+        elif args.file_format == "fq":
+            sys.exit(convert_reads(args.inputs, args.out_dir))
     elif args.command == "index":
         sys.exit(bwa_index(args.index_fasta))
     elif args.command == "index-mem2":
         sys.exit(bwa_index(args.index_mem2_fasta, ver="mem2"))
-    elif args.command == "c2t_fq":
-        sys.exit(convert_reads(args.fq1, args.fq2, args.out_dir))
     elif args.command == "cnvs":
         sys.exit(cnvs_main(args.regions, args.bams))
     elif args.command == "align":
